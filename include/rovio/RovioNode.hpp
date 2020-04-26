@@ -33,6 +33,8 @@
 #include <mutex>
 #include <queue>
 
+#include <random>
+
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
@@ -58,12 +60,90 @@
 
 namespace rovio {
 
+class ImuNoise {
+    std::mt19937 rng_;
+    std::normal_distribution<> gauss_;
+
+    const double g_;
+
+    const double gyro_bias_stability_norm_;
+    const double accel_bias_stability_norm_;
+    const double min_sample_time_;
+
+    const double gyro_arw_;
+    const double accel_arw_;
+
+    Eigen::Vector3d accel_bias_;
+    Eigen::Vector3d gyro_bias_;
+    ros::Time last_time_;
+
+    Eigen::Vector3d random_vector() {
+        return Eigen::Vector3d(gauss_(rng_), gauss_(rng_), gauss_(rng_));
+    }
+
+    template <typename T>
+    T getParam(const ros::NodeHandle& nh, const std::string& name) {
+        T result;
+        const bool success = nh.getParam(name, result);
+        if (!success) {
+            throw std::runtime_error("Failed to get parameter");
+        }
+
+        return result;
+    }
+
+  public:
+    ImuNoise(const ros::NodeHandle& nh)
+        : rng_(std::random_device{}()),
+          gauss_(),
+          g_(9.80665),
+          gyro_bias_stability_norm_(
+                  (getParam<double>(nh, "imu/gyro/bias_stability") / 3600 * M_PI
+                   / 180)
+                  / std::sqrt(getParam<double>(nh, "imu/gyro/tau"))),
+          accel_bias_stability_norm_(
+                  (getParam<double>(nh, "imu/accel/bias_stability") * 1e-6 * g_)
+                  / std::sqrt(getParam<double>(nh, "imu/accel/tau"))),
+          min_sample_time_(getParam<double>(nh, "imu/min_sample_time")),
+          gyro_arw_(getParam<double>(nh, "imu/gyro/arw") / std::sqrt(3600.) * M_PI
+                    / 180),
+          accel_arw_(getParam<double>(nh, "imu/accel/arw") * g_ / 1e3),
+          accel_bias_(Eigen::Vector3d::Zero()),
+          gyro_bias_(Eigen::Vector3d::Zero()) {}
+
+    std::pair<Eigen::Vector3d, Eigen::Vector3d> noises(const ros::Time& time) {
+        if (last_time_ == ros::Time(0)) {
+            last_time_ = time;
+            return std::make_pair(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+        }
+
+        const double dt = (time - last_time_).toSec();
+        const double sqrt_dt = std::sqrt(std::max(dt, min_sample_time_));
+
+        const double gyro_sigma = gyro_arw_ / sqrt_dt;
+        const Eigen::Vector3d gyro_result =
+                random_vector() * gyro_sigma + gyro_bias_;
+        const double gyro_sigma_bias = gyro_bias_stability_norm_ * sqrt_dt;
+        gyro_bias_ += random_vector() * gyro_sigma_bias;
+
+        const double accel_sigma = accel_arw_ / sqrt_dt;
+        const Eigen::Vector3d accel_result =
+                random_vector() * accel_sigma + accel_bias_;
+        const double accel_sigma_bias = accel_bias_stability_norm_ * sqrt_dt;
+        accel_bias_ += random_vector() * accel_sigma_bias;
+
+        last_time_ = time;
+        return std::make_pair(gyro_result, accel_result);
+    }
+};
+
 /** \brief Class, defining the Rovio Node
  *
  *  @tparam FILTER  - \ref rovio::RovioFilter
  */
 template<typename FILTER>
 class RovioNode{
+  ImuNoise imu_noise_;
  public:
   // Filter Stuff
   typedef FILTER mtFilter;
@@ -186,7 +266,7 @@ class RovioNode{
   /** \brief Constructor
    */
   RovioNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private, std::shared_ptr<mtFilter> mpFilter)
-      : nh_(nh), nh_private_(nh_private), mpFilter_(mpFilter), transformFeatureOutputCT_(&mpFilter->multiCamera_), landmarkOutputImuCT_(&mpFilter->multiCamera_),
+      : imu_noise_(nh_private), nh_(nh), nh_private_(nh_private), mpFilter_(mpFilter), transformFeatureOutputCT_(&mpFilter->multiCamera_), landmarkOutputImuCT_(&mpFilter->multiCamera_),
         cameraOutputCov_((int)(mtOutput::D_),(int)(mtOutput::D_)), featureOutputCov_((int)(FeatureOutput::D_),(int)(FeatureOutput::D_)), landmarkOutputCov_(3,3),
         featureOutputReadableCov_((int)(FeatureOutputReadable::D_),(int)(FeatureOutputReadable::D_)){
     #ifndef NDEBUG
@@ -440,21 +520,35 @@ class RovioNode{
    */
   void imuCallback(const sensor_msgs::Imu::ConstPtr& imu_msg){
     std::lock_guard<std::mutex> lock(m_filter_);
-    predictionMeas_.template get<mtPredictionMeas::_acc>() = Eigen::Vector3d(imu_msg->linear_acceleration.x,imu_msg->linear_acceleration.y,imu_msg->linear_acceleration.z);
-    predictionMeas_.template get<mtPredictionMeas::_gyr>() = Eigen::Vector3d(imu_msg->angular_velocity.x,imu_msg->angular_velocity.y,imu_msg->angular_velocity.z);
+
+    // NOISIFY IMU HERE
+    const sensor_msgs::Imu::Ptr imu_msg_noisy = boost::make_shared<sensor_msgs::Imu>(*imu_msg);
+
+    const auto noises = imu_noise_.noises(imu_msg->header.stamp);
+    imu_msg_noisy->angular_velocity.x += noises.first(0);
+    imu_msg_noisy->angular_velocity.y += noises.first(1);
+    imu_msg_noisy->angular_velocity.z += noises.first(2);
+    imu_msg_noisy->linear_acceleration.x += noises.second(0);
+    imu_msg_noisy->linear_acceleration.y += noises.second(1);
+    imu_msg_noisy->linear_acceleration.z += noises.second(2);
+
+    // END NOISIFY IMU
+
+    predictionMeas_.template get<mtPredictionMeas::_acc>() = Eigen::Vector3d(imu_msg_noisy->linear_acceleration.x,imu_msg_noisy->linear_acceleration.y,imu_msg_noisy->linear_acceleration.z);
+    predictionMeas_.template get<mtPredictionMeas::_gyr>() = Eigen::Vector3d(imu_msg_noisy->angular_velocity.x,imu_msg_noisy->angular_velocity.y,imu_msg_noisy->angular_velocity.z);
     if(init_state_.isInitialized()){
-      mpFilter_->addPredictionMeas(predictionMeas_,imu_msg->header.stamp.toSec());
+      mpFilter_->addPredictionMeas(predictionMeas_,imu_msg_noisy->header.stamp.toSec());
       updateAndPublish();
     } else {
       switch(init_state_.state_) {
         case FilterInitializationState::State::WaitForInitExternalPose: {
           std::cout << "-- Filter: Initializing using external pose ..." << std::endl;
-          mpFilter_->resetWithPose(init_state_.WrWM_, init_state_.qMW_, imu_msg->header.stamp.toSec());
+          mpFilter_->resetWithPose(init_state_.WrWM_, init_state_.qMW_, imu_msg_noisy->header.stamp.toSec());
           break;
         }
         case FilterInitializationState::State::WaitForInitUsingAccel: {
           std::cout << "-- Filter: Initializing using accel. measurement ..." << std::endl;
-          mpFilter_->resetWithAccelerometer(predictionMeas_.template get<mtPredictionMeas::_acc>(),imu_msg->header.stamp.toSec());
+          mpFilter_->resetWithAccelerometer(predictionMeas_.template get<mtPredictionMeas::_acc>(),imu_msg_noisy->header.stamp.toSec());
           break;
         }
         default: {
@@ -465,7 +559,7 @@ class RovioNode{
       }
 
       std::cout << std::setprecision(12);
-      std::cout << "-- Filter: Initialized at t = " << imu_msg->header.stamp.toSec() << std::endl;
+      std::cout << "-- Filter: Initialized at t = " << imu_msg_noisy->header.stamp.toSec() << std::endl;
       init_state_.state_ = FilterInitializationState::State::Initialized;
     }
   }

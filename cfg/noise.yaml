@@ -1,0 +1,10 @@
+imu:
+  gyro:
+    bias_stability: 4.6
+    tau: 500
+    arw: 3 # 0.3
+  accel:
+    bias_stability: 36.0
+    tau: 800
+    arw: 2.4 # 0.24
+  min_sample_time: 0.000

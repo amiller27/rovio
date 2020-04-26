@@ -4,5 +4,6 @@
   <param name="filter_config" value="$(find rovio)/cfg/rovio.info"/>
   <param name="camera0_config" value="$(find rovio)/cfg/euroc_cam0.yaml"/>
   <param name="camera1_config" value="$(find rovio)/cfg/euroc_cam1.yaml"/>
+  <rosparam command="load" file="$(find rovio)/cfg/noise.yaml" />
   </node>
 </launch>
