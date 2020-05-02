@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?> 
+<launch>
+  <node pkg="rovio" type="rovio_node" name="rovio" output="screen">
+  <param name="filter_config" value="$(find rovio)/cfg/rovio_tartanair.info"/>
+  <param name="camera0_config" value="$(find rovio)/cfg/tartanair_cam0.yaml"/>
+  <rosparam command="load" file="$(find rovio)/cfg/noise.yaml" />
+  </node>
+</launch>

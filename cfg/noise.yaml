@@ -1,4 +1,5 @@
 imu:
+  add_noise: false
   gyro:
     bias_stability: 4.6
     tau: 500
@@ -8,3 +9,9 @@ imu:
     tau: 800
     arw: 2.4 # 0.24
   min_sample_time: 0.000
+img:
+  add_noise: false
+  gaussian_noise: 30
+  sap:
+    add_noise: true
+    prob: 0.1

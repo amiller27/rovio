@@ -60,6 +60,17 @@
 
 namespace rovio {
 
+template <typename T>
+T getParam(const ros::NodeHandle& nh, const std::string& name) {
+    T result;
+    const bool success = nh.getParam(name, result);
+    if (!success) {
+        throw std::runtime_error("Failed to get parameter");
+    }
+
+    return result;
+}
+
 class ImuNoise {
     std::mt19937 rng_;
     std::normal_distribution<> gauss_;
@@ -79,17 +90,6 @@ class ImuNoise {
 
     Eigen::Vector3d random_vector() {
         return Eigen::Vector3d(gauss_(rng_), gauss_(rng_), gauss_(rng_));
-    }
-
-    template <typename T>
-    T getParam(const ros::NodeHandle& nh, const std::string& name) {
-        T result;
-        const bool success = nh.getParam(name, result);
-        if (!success) {
-            throw std::runtime_error("Failed to get parameter");
-        }
-
-        return result;
     }
 
   public:
@@ -137,6 +137,38 @@ class ImuNoise {
     }
 };
 
+class SAPNoise {
+    std::mt19937 rng_;
+    const double prob_;
+
+  public:
+    SAPNoise(const ros::NodeHandle& nh)
+        : rng_(std::random_device{}()),
+          prob_(getParam<double>(nh, "img/sap/prob")) {}
+
+    cv::Mat shake(const cv::Mat& in) {
+        cv::Mat out = in.clone();
+
+        std::uniform_int_distribution<int> rand_row(0, in.rows - 1);
+        std::uniform_int_distribution<int> rand_col(0, in.cols - 1);
+        std::bernoulli_distribution p(0.5);
+
+        const int n = in.rows * in.cols * prob_;
+
+        for (int count = 0; count < n; count++) {
+            const int row = rand_row(rng_);
+            const int col = rand_col(rng_);
+            if (p(rng_)) {
+                out.at<uchar>(row, col) = 0;
+            } else {
+                out.at<uchar>(row, col) = 255;
+            }
+        }
+
+        return out;
+    }
+};
+
 /** \brief Class, defining the Rovio Node
  *
  *  @tparam FILTER  - \ref rovio::RovioFilter
@@ -144,6 +176,11 @@ class ImuNoise {
 template<typename FILTER>
 class RovioNode{
   ImuNoise imu_noise_;
+  SAPNoise sap_noise_;
+  const double gaussian_noise_;
+  const bool add_imu_noise_;
+  const bool add_image_noise_;
+  const bool add_sap_noise_;
  public:
   // Filter Stuff
   typedef FILTER mtFilter;
@@ -266,7 +303,13 @@ class RovioNode{
   /** \brief Constructor
    */
   RovioNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private, std::shared_ptr<mtFilter> mpFilter)
-      : imu_noise_(nh_private), nh_(nh), nh_private_(nh_private), mpFilter_(mpFilter), transformFeatureOutputCT_(&mpFilter->multiCamera_), landmarkOutputImuCT_(&mpFilter->multiCamera_),
+      : imu_noise_(nh_private),
+        sap_noise_(nh_private),
+        gaussian_noise_(getParam<double>(nh_private, "img/gaussian_noise")),
+        add_imu_noise_(getParam<bool>(nh_private, "imu/add_noise")),
+        add_image_noise_(getParam<bool>(nh_private, "img/add_noise")),
+        add_sap_noise_(getParam<bool>(nh_private, "img/sap/add_noise")),
+        nh_(nh), nh_private_(nh_private), mpFilter_(mpFilter), transformFeatureOutputCT_(&mpFilter->multiCamera_), landmarkOutputImuCT_(&mpFilter->multiCamera_),
         cameraOutputCov_((int)(mtOutput::D_),(int)(mtOutput::D_)), featureOutputCov_((int)(FeatureOutput::D_),(int)(FeatureOutput::D_)), landmarkOutputCov_(3,3),
         featureOutputReadableCov_((int)(FeatureOutputReadable::D_),(int)(FeatureOutputReadable::D_)){
     #ifndef NDEBUG
@@ -524,13 +567,15 @@ class RovioNode{
     // NOISIFY IMU HERE
     const sensor_msgs::Imu::Ptr imu_msg_noisy = boost::make_shared<sensor_msgs::Imu>(*imu_msg);
 
-    const auto noises = imu_noise_.noises(imu_msg->header.stamp);
-    imu_msg_noisy->angular_velocity.x += noises.first(0);
-    imu_msg_noisy->angular_velocity.y += noises.first(1);
-    imu_msg_noisy->angular_velocity.z += noises.first(2);
-    imu_msg_noisy->linear_acceleration.x += noises.second(0);
-    imu_msg_noisy->linear_acceleration.y += noises.second(1);
-    imu_msg_noisy->linear_acceleration.z += noises.second(2);
+    if (add_imu_noise_) {
+        const auto noises = imu_noise_.noises(imu_msg->header.stamp);
+        imu_msg_noisy->angular_velocity.x += noises.first(0);
+        imu_msg_noisy->angular_velocity.y += noises.first(1);
+        imu_msg_noisy->angular_velocity.z += noises.first(2);
+        imu_msg_noisy->linear_acceleration.x += noises.second(0);
+        imu_msg_noisy->linear_acceleration.y += noises.second(1);
+        imu_msg_noisy->linear_acceleration.z += noises.second(2);
+    }
 
     // END NOISIFY IMU
 
@@ -593,13 +638,26 @@ class RovioNode{
     // Get image from msg
     cv_bridge::CvImagePtr cv_ptr;
     try {
-      cv_ptr = cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::TYPE_8UC1);
+      cv_ptr = cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::MONO8);
     } catch (cv_bridge::Exception& e) {
       ROS_ERROR("cv_bridge exception: %s", e.what());
       return;
     }
     cv::Mat cv_img;
     cv_ptr->image.copyTo(cv_img);
+
+    cv::Mat cv_img_noise = cv_img.clone();
+    cv::randn(cv_img_noise,
+              0,
+              add_image_noise_ ? gaussian_noise_ : 0);
+    cv::Mat cv_img_noisy = cv_img_noise + cv_img;
+
+    if (add_sap_noise_) {
+        const cv::Mat cv_img_final = sap_noise_.shake(cv_img_noisy);
+        cv_img_noisy = cv_img_final;
+    }
+    //cv::Mat cv_img_final = add_sap_noise_ ? sap_noise_.shake(cv_img_noisy) : cv_img_noisy;
+
     if(init_state_.isInitialized() && !cv_img.empty()){
       double msgTime = img->header.stamp.toSec();
       if(msgTime != imgUpdateMeas_.template get<mtImgMeas::_aux>().imgTime_){
@@ -610,7 +668,7 @@ class RovioNode{
         }
         imgUpdateMeas_.template get<mtImgMeas::_aux>().reset(msgTime);
       }
-      imgUpdateMeas_.template get<mtImgMeas::_aux>().pyr_[camID].computeFromImage(cv_img,true);
+      imgUpdateMeas_.template get<mtImgMeas::_aux>().pyr_[camID].computeFromImage(cv_img_noisy,true);
       imgUpdateMeas_.template get<mtImgMeas::_aux>().isValidPyr_[camID] = true;
 
       if(imgUpdateMeas_.template get<mtImgMeas::_aux>().areAllValid()){
