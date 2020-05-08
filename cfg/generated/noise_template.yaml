@@ -1,0 +1,17 @@
+imu:
+  add_noise: {{ imu_noise }}
+  gyro:
+    bias_stability: 4.6
+    tau: 500
+    arw: {{ x * 0.3 }}
+  accel:
+    bias_stability: 36.0
+    tau: 800
+    arw: {{ x * 0.24 }}
+  min_sample_time: 0.000
+img:
+  add_noise: {{ image_noise }}
+  gaussian_noise: {{ p }}
+  sap:
+    add_noise: {{ sap_noise }}
+    prob: {{ sap_p }}

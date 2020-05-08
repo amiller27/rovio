@@ -658,6 +658,14 @@ class RovioNode{
     }
     //cv::Mat cv_img_final = add_sap_noise_ ? sap_noise_.shake(cv_img_noisy) : cv_img_noisy;
 
+    constexpr const static bool WRITE_IMAGES_OUT = false;
+    if (WRITE_IMAGES_OUT) {
+        cv::imwrite("data/output/euroc/raw.png", cv_img);
+        cv::imwrite("data/output/euroc/noisy.png", cv_img_noisy);
+        throw std::runtime_error("Exit");
+    }
+
+
     if(init_state_.isInitialized() && !cv_img.empty()){
       double msgTime = img->header.stamp.toSec();
       if(msgTime != imgUpdateMeas_.template get<mtImgMeas::_aux>().imgTime_){
